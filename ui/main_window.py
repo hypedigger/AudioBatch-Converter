@@ -1,0 +1,1347 @@
+import json
+import os
+from datetime import datetime
+from typing import List, Optional
+
+from PyQt6.QtCore    import Qt, QSize, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QPushButton, QLineEdit, QFileDialog, QCheckBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
+    QProgressBar, QSizePolicy, QFrame, QAbstractItemView,
+    QMessageBox, QDialog, QScrollArea, QMenu,
+)
+from PyQt6.QtGui import QFont, QCursor
+
+from core.config    import (APP_TITLE, SUPPORTED_INPUT_FORMATS, OUTPUT_FORMATS,
+                             DEFAULT_SETTINGS, CONFIG_FILE)
+from core.scanner   import FileInfo, scan_directory, file_info_from_path
+from core.converter import ConversionThread, detect_conflicts
+from core.logger    import get_app_logger
+from core.tags      import is_editable
+from ui.styles      import get_theme
+from ui.effects     import apply_acrylic
+from ui.icon        import create_app_icon
+from ui.log_window  import LogWindow
+from ui.settings_dialog import SettingsDialog
+from ui.tag_editor_dialog import TagEditorDialog
+from ui.preview_player import PreviewPlayer
+
+
+# ── Sortable table items ──────────────────────────────────────────────────────
+
+class _SizeItem(QTableWidgetItem):
+    def __init__(self, size: int, label: str):
+        super().__init__(label)
+        self._size = size
+    def __lt__(self, other):
+        if isinstance(other, _SizeItem):
+            return self._size < other._size
+        return super().__lt__(other)
+
+
+class _DateItem(QTableWidgetItem):
+    def __init__(self, ts: float, label: str):
+        super().__init__(label)
+        self._ts = ts
+    def __lt__(self, other):
+        if isinstance(other, _DateItem):
+            return self._ts < other._ts
+        return super().__lt__(other)
+
+
+# ── Custom table with Space-key checkbox toggle ───────────────────────────────
+
+class _FileTable(QTableWidget):
+    """QTableWidget that toggles checkboxes with Space and supports multi-row selection."""
+
+    mouse_left = pyqtSignal()   # curseur sorti de la table (efface le ▶ de survol)
+
+    def leaveEvent(self, event):
+        self.mouse_left.emit()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            rows = {idx.row() for idx in self.selectedIndexes()}
+            if not rows:
+                super().keyPressEvent(event)
+                return
+            # If any selected row is unchecked → check all; else uncheck all
+            has_unchecked = any(
+                self.item(r, COL_CHECK) and
+                self.item(r, COL_CHECK).checkState() == Qt.CheckState.Unchecked
+                for r in rows
+            )
+            new_state = Qt.CheckState.Checked if has_unchecked else Qt.CheckState.Unchecked
+            self.blockSignals(True)
+            for r in rows:
+                item = self.item(r, COL_CHECK)
+                if item:
+                    item.setCheckState(new_state)
+            self.blockSignals(False)
+            # Notify parent via itemChanged on the first item
+            first_item = self.item(min(rows), COL_CHECK)
+            if first_item:
+                self.itemChanged.emit(first_item)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
+# ── Conflict dialog ───────────────────────────────────────────────────────────
+
+class _ConflictDialog(QDialog):
+    def __init__(self, conflicts: List[FileInfo], out_ext: str, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedWidth(480)
+        self._choice = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("central_widget")
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(14)
+
+        title = QLabel("⚠️  Conflits détectés")
+        title.setFont(QFont("Segoe UI Variable", 14, QFont.Weight.Bold))
+        title.setStyleSheet("color: #f0c060;")
+        lay.addWidget(title)
+
+        n = len(conflicts)
+        msg = QLabel(
+            f"{n} fichier(s) existent déjà en .{out_ext} dans le répertoire cible.\n"
+            "Que souhaitez-vous faire ?"
+        )
+        msg.setWordWrap(True)
+        msg.setStyleSheet("color: rgba(255,255,255,180); font-size:13px;")
+        lay.addWidget(msg)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        btn_cancel = QPushButton("Annuler")
+        btn_cancel.clicked.connect(lambda: self._choose(None))
+        btn_row.addWidget(btn_cancel)
+
+        btn_ren = QPushButton("Renommer  (_v1, _v2…)")
+        btn_ren.clicked.connect(lambda: self._choose("rename"))
+        btn_row.addWidget(btn_ren)
+
+        btn_ow = QPushButton("Écraser")
+        btn_ow.setObjectName("btn_primary")
+        btn_ow.clicked.connect(lambda: self._choose("overwrite"))
+        btn_row.addWidget(btn_ow)
+
+        lay.addLayout(btn_row)
+        self.adjustSize()
+
+    def _choose(self, val):
+        self._choice = val
+        if val is None:
+            self.reject()
+        else:
+            self.accept()
+
+    def get_choice(self) -> Optional[str]:
+        return self._choice
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        apply_acrylic(int(self.winId()), dark=True)
+
+
+# ── Windows Recycle Bin helper (no extra dependency) ─────────────────────────
+
+def _send_to_recycle_bin(path: str):
+    import ctypes
+    import ctypes.wintypes
+
+    class _SHFILEOPSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("hwnd",                  ctypes.wintypes.HWND),
+            ("wFunc",                 ctypes.wintypes.UINT),
+            ("pFrom",                 ctypes.c_wchar_p),
+            ("pTo",                   ctypes.c_wchar_p),
+            ("fFlags",                ctypes.c_ushort),
+            ("fAnyOperationsAborted", ctypes.wintypes.BOOL),
+            ("hNameMappings",         ctypes.c_void_p),
+            ("lpszProgressTitle",     ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE          = 0x0003
+    FOF_ALLOWUNDO      = 0x0040
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_SILENT         = 0x0004
+
+    norm = os.path.normpath(path) + "\x00"   # double-null terminated
+    op = _SHFILEOPSTRUCT()
+    op.wFunc  = FO_DELETE
+    op.pFrom  = norm
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+
+    rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if rc != 0:
+        raise RuntimeError(f"Impossible d'envoyer vers la corbeille (code {rc})")
+
+
+# ── Main Window ───────────────────────────────────────────────────────────────
+
+COL_PLAY  = 0
+COL_CHECK = 1
+COL_NAME  = 2
+COL_DIR   = 3
+COL_SIZE  = 4
+COL_DATE  = 5
+COL_EXT   = 6
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self._settings      = self._load_settings()
+        self._files: List[FileInfo] = []
+        self._thread: Optional[ConversionThread] = None
+        self._playing_path  = ""           # fichier en cours de pré-écoute
+        self._hover_row     = -1
+        self._log_window: Optional[LogWindow] = None
+        self._drag_pos      = None
+        self._resize_edge   = None
+        self._resize_start  = None
+        self._resize_geom   = None
+        self._RESIZE_MARGIN = 8
+        self._conv_summary: dict = {}
+
+        self.setWindowIcon(create_app_icon())
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.Window
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMinimumSize(1000, 660)
+        self.resize(1260, 780)
+        self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+
+        self._build_ui()
+        self._apply_theme()
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # UI BUILD
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _build_ui(self):
+        root = QWidget()
+        root.setObjectName("root_widget")
+        self.setCentralWidget(root)
+        root_lay = QVBoxLayout(root)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+
+        self._central = QWidget()
+        self._central.setObjectName("central_widget")
+        self._central.setMouseTracking(True)
+        root_lay.addWidget(self._central)
+
+        main_lay = QVBoxLayout(self._central)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setSpacing(0)
+
+        main_lay.addWidget(self._make_title_bar())
+        main_lay.addWidget(self._make_body(), 1)
+        main_lay.addWidget(self._make_status_bar())
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+
+    def _make_title_bar(self) -> QWidget:
+        tb = QWidget()
+        tb.setObjectName("title_bar")
+        tb.setFixedHeight(44)
+        lay = QHBoxLayout(tb)
+        lay.setContentsMargins(16, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Icon
+        icon = QLabel("🎵")
+        icon.setFont(QFont("Segoe UI Emoji", 16))
+        icon.setStyleSheet("margin-right:8px;")
+        lay.addWidget(icon)
+
+        # Title
+        lbl = QLabel(APP_TITLE)
+        lbl.setObjectName("title_label")
+        lay.addWidget(lbl)
+        lay.addStretch()
+
+        # Log button
+        self._btn_log = QPushButton("📋 Logs")
+        self._btn_log.setObjectName("btn_icon")
+        self._btn_log.setFixedHeight(32)
+        self._btn_log.clicked.connect(self._toggle_log)
+        lay.addWidget(self._btn_log)
+
+        lay.addSpacing(12)   # séparation avant les contrôles fenêtre
+
+        # Settings
+        btn_settings = QPushButton("⚙")
+        btn_settings.setObjectName("btn_icon")
+        btn_settings.setFixedSize(46, 32)
+        btn_settings.setFont(QFont("Segoe UI Emoji", 14))
+        btn_settings.clicked.connect(self._open_settings)
+        lay.addWidget(btn_settings)
+
+        # Win controls
+        for name, txt, slot in [
+            ("btn_minimize", "─", self.showMinimized),
+            ("btn_maximize", "□", self._toggle_maximize),
+            ("btn_close",    "✕", self.close),
+        ]:
+            b = QPushButton(txt)
+            b.setObjectName(name)
+            b.clicked.connect(slot)
+            lay.addWidget(b)
+
+        # Dragging
+        tb.mousePressEvent   = self._tb_press
+        tb.mouseMoveEvent    = self._tb_move
+        tb.mouseReleaseEvent = self._tb_release
+        return tb
+
+    # ── Body ──────────────────────────────────────────────────────────────────
+
+    def _make_body(self) -> QWidget:
+        body = QWidget()
+        lay  = QVBoxLayout(body)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(10)
+
+        lay.addWidget(self._make_top_panel())
+        lay.addWidget(self._make_list_panel(), 1)
+
+        self._preview = PreviewPlayer()
+        self._preview.stopped.connect(self._on_preview_stopped)
+        lay.addWidget(self._preview)
+
+        lay.addWidget(self._make_bottom_panel())
+        return body
+
+    # ── Top panel (directory + formats) ──────────────────────────────────────
+
+    def _make_top_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel_top")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(12)
+
+        # Directory row
+        dir_row = QHBoxLayout()
+        lbl_dir = QLabel("RÉPERTOIRE")
+        lbl_dir.setObjectName("label_section")
+        dir_row.addWidget(lbl_dir)
+
+        self._dir_edit = QLineEdit()
+        self._dir_edit.setReadOnly(True)
+        self._dir_edit.setPlaceholderText("Sélectionner un répertoire…")
+        last = self._settings.get("last_directory", "")
+        if last and os.path.isdir(last):
+            self._dir_edit.setText(last)
+        dir_row.addWidget(self._dir_edit, 1)
+
+        btn_browse = QPushButton("📂  Parcourir")
+        btn_browse.setObjectName("btn_secondary")
+        btn_browse.clicked.connect(self._browse_directory)
+        dir_row.addWidget(btn_browse)
+        lay.addLayout(dir_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # Formats row
+        fmt_row = QHBoxLayout()
+        fmt_row.setSpacing(0)
+
+        lbl_fmt = QLabel("FORMATS")
+        lbl_fmt.setObjectName("label_section")
+        lbl_fmt.setFixedWidth(90)
+        fmt_row.addWidget(lbl_fmt)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setFixedHeight(34)
+        scroll.setStyleSheet("background: transparent;")
+
+        fmt_inner = QWidget()
+        fmt_inner.setStyleSheet("background: transparent;")
+        fmt_lay = QHBoxLayout(fmt_inner)
+        fmt_lay.setContentsMargins(0, 0, 0, 0)
+        fmt_lay.setSpacing(10)
+
+        self._format_checks = {}
+        selected = self._settings.get("selected_formats", list(SUPPORTED_INPUT_FORMATS.keys()))
+        for name in SUPPORTED_INPUT_FORMATS:
+            cb = QCheckBox(name)
+            cb.setChecked(name in selected)
+            self._format_checks[name] = cb
+            fmt_lay.addWidget(cb)
+        fmt_lay.addStretch()
+
+        scroll.setWidget(fmt_inner)
+        fmt_row.addWidget(scroll, 1)
+
+        # All / None shortcuts
+        btn_all  = QPushButton("Tous")
+        btn_all.clicked.connect(lambda: self._set_all_formats(True))
+        btn_none = QPushButton("Aucun")
+        btn_none.clicked.connect(lambda: self._set_all_formats(False))
+        fmt_row.addWidget(btn_all)
+        fmt_row.addWidget(btn_none)
+
+        btn_scan = QPushButton("  Afficher les fichiers  ")
+        btn_scan.setObjectName("btn_primary")
+        btn_scan.clicked.connect(self._scan_directory)
+        fmt_row.addWidget(btn_scan)
+
+        lay.addLayout(fmt_row)
+        return panel
+
+    # ── List panel ────────────────────────────────────────────────────────────
+
+    def _make_list_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel_list")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+
+        # Toolbar row
+        tool_row = QHBoxLayout()
+
+        self._lbl_count = QLabel("Aucun fichier — glissez un dossier ici")
+        self._lbl_count.setObjectName("label_count")
+        tool_row.addWidget(self._lbl_count)
+        tool_row.addStretch()
+
+        btn_all_sel  = QPushButton("✓ Tout sélectionner")
+        btn_all_sel.clicked.connect(lambda: self._set_all_checked(True))
+        btn_none_sel = QPushButton("✗ Tout désélectionner")
+        btn_none_sel.clicked.connect(lambda: self._set_all_checked(False))
+        tool_row.addWidget(btn_all_sel)
+        tool_row.addWidget(btn_none_sel)
+        lay.addLayout(tool_row)
+
+        # Table
+        self._table = _FileTable()
+        self._table.setColumnCount(7)
+        self._table.setHorizontalHeaderLabels(
+            ["", "", "Nom", "Répertoire", "Taille", "Date", "Ext."]
+        )
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setSortingEnabled(True)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setShowGrid(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setAlternatingRowColors(False)
+        self._table.setIconSize(QSize(0, 0))
+
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(COL_PLAY,  QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(COL_CHECK, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(COL_NAME,  QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(COL_DIR,   QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(COL_SIZE,  QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(COL_DATE,  QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(COL_EXT,   QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(COL_PLAY,  36)
+        self._table.setColumnWidth(COL_CHECK, 36)
+        self._table.setColumnWidth(COL_SIZE,  90)
+        self._table.setColumnWidth(COL_DATE,  140)
+        self._table.setColumnWidth(COL_EXT,   70)
+        self._table.verticalHeader().setDefaultSectionSize(38)
+
+        # Survol → bouton ▶ en début de ligne ; clic → lecture / tags
+        self._table.setMouseTracking(True)
+        self._table.cellEntered.connect(self._on_cell_entered)
+        self._table.cellClicked.connect(self._on_cell_clicked)
+        self._table.mouse_left.connect(self._on_table_left)
+
+        self._table.itemChanged.connect(self._on_item_changed)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_context_menu)
+        lay.addWidget(self._table, 1)
+        return panel
+
+    # ── Bottom panel (conversion controls + progress) ─────────────────────────
+
+    def _make_bottom_panel(self) -> QWidget:
+        self._panel_bottom = QWidget()
+        self._panel_bottom.setObjectName("panel_bottom")
+        lay = QVBoxLayout(self._panel_bottom)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(10)
+
+        # Progress row (hidden until conversion starts)
+        self._progress_row = QWidget()
+        pr_lay = QVBoxLayout(self._progress_row)
+        pr_lay.setContentsMargins(0, 0, 0, 0)
+        pr_lay.setSpacing(4)
+
+        self._lbl_progress = QLabel("Conversion en cours…  0 / 0")
+        self._lbl_progress.setObjectName("label_desc")
+        pr_lay.addWidget(self._lbl_progress)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFixedHeight(8)
+        pr_lay.addWidget(self._progress_bar)
+
+        self._progress_row.hide()
+        lay.addWidget(self._progress_row)
+
+        # Controls row
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(12)
+
+        # Format selector
+        lbl_fmt = QLabel("Format de sortie :")
+        lbl_fmt.setStyleSheet("color: rgba(255,255,255,160); font-size:13px;")
+        ctrl_row.addWidget(lbl_fmt)
+
+        self._combo_out_fmt = QComboBox()
+        self._combo_out_fmt.setMinimumWidth(260)
+        default_id = self._settings.get("default_output_format", "mp3_320")
+        for i, fmt in enumerate(OUTPUT_FORMATS):
+            self._combo_out_fmt.addItem(fmt["label"], userData=fmt)
+            if fmt["id"] == default_id:
+                self._combo_out_fmt.setCurrentIndex(i)
+        self._combo_out_fmt.currentIndexChanged.connect(self._on_format_changed)
+        ctrl_row.addWidget(self._combo_out_fmt)
+
+        # Description label
+        self._lbl_fmt_desc = QLabel()
+        self._lbl_fmt_desc.setObjectName("label_desc")
+        self._lbl_fmt_desc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        ctrl_row.addWidget(self._lbl_fmt_desc, 1)
+        self._update_fmt_desc()
+
+        # Delete source checkbox
+        self._chk_delete = QCheckBox("Supprimer la source après conversion")
+        ctrl_row.addWidget(self._chk_delete)
+
+        ctrl_row.addStretch()
+
+        # Convert button
+        self._btn_convert = QPushButton("  ▶  Convertir  ")
+        self._btn_convert.setObjectName("btn_primary")
+        self._btn_convert.setEnabled(False)
+        self._btn_convert.clicked.connect(self._start_conversion)
+        ctrl_row.addWidget(self._btn_convert)
+
+        # Cancel button (hidden)
+        self._btn_cancel_conv = QPushButton("⏹  Annuler")
+        self._btn_cancel_conv.clicked.connect(self._cancel_conversion)
+        self._btn_cancel_conv.hide()
+        ctrl_row.addWidget(self._btn_cancel_conv)
+
+        lay.addLayout(ctrl_row)
+        return self._panel_bottom
+
+    # ── Status bar ────────────────────────────────────────────────────────────
+
+    def _make_status_bar(self) -> QWidget:
+        sb = QWidget()
+        sb.setObjectName("status_bar")
+        sb.setFixedHeight(28)
+        lay = QHBoxLayout(sb)
+        lay.setContentsMargins(16, 0, 16, 0)
+
+        self._status_lbl = QLabel("Prêt")
+        self._status_lbl.setObjectName("status_label")
+        lay.addWidget(self._status_lbl)
+        lay.addStretch()
+
+        ver_lbl = QLabel(f"v{APP_TITLE.split('—')[1].strip()}")
+        ver_lbl.setObjectName("status_label")
+        lay.addWidget(ver_lbl)
+        return sb
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # ACTIONS
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _browse_directory(self):
+        last = self._dir_edit.text() or os.path.expanduser("~")
+        path = QFileDialog.getExistingDirectory(self, "Sélectionner un répertoire", last)
+        if path:
+            self._dir_edit.setText(path)
+            self._settings["last_directory"] = path
+            self._save_settings()
+
+    def _set_all_formats(self, state: bool):
+        for cb in self._format_checks.values():
+            cb.setChecked(state)
+
+    def _scan_directory(self):
+        path = self._dir_edit.text().strip()
+        if not path or not os.path.isdir(path):
+            self._set_status("Veuillez sélectionner un répertoire valide.")
+            return
+
+        selected_fmts = [ext for name, ext in SUPPORTED_INPUT_FORMATS.items()
+                         if self._format_checks[name].isChecked()]
+        if not selected_fmts:
+            self._set_status("Veuillez sélectionner au moins un format.")
+            return
+
+        self._set_status("Scan en cours…")
+        self._files = scan_directory(path, selected_fmts)
+        self._populate_table()
+
+        n = len(self._files)
+        self._lbl_count.setText(f"{n} fichier(s) trouvé(s)")
+        self._set_status(f"{n} fichier(s) trouvé(s) dans {path}")
+        get_app_logger().info("Scan: %d fichiers dans %s", n, path)
+
+    def _populate_table(self):
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(0)
+        self._table.blockSignals(True)
+
+        for fi in self._files:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+
+            # Play (▶ affiché au survol de la ligne)
+            play = QTableWidgetItem("")
+            play.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            play.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row, COL_PLAY, play)
+
+            # Checkbox — stores FileInfo as UserRole data
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Unchecked)
+            chk.setData(Qt.ItemDataRole.UserRole, fi)
+            self._table.setItem(row, COL_CHECK, chk)
+
+            # Name
+            self._table.setItem(row, COL_NAME, QTableWidgetItem(fi.name))
+
+            # Directory (relative if long)
+            self._table.setItem(row, COL_DIR,  QTableWidgetItem(fi.directory))
+
+            # Size
+            size_item = _SizeItem(fi.size, fi.size_str())
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table.setItem(row, COL_SIZE, size_item)
+
+            # Date
+            dt = datetime.fromtimestamp(fi.date_created).strftime("%d/%m/%Y  %H:%M")
+            self._table.setItem(row, COL_DATE, _DateItem(fi.date_created, dt))
+
+            # Extension
+            ext_item = QTableWidgetItem(fi.extension.upper())
+            ext_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row, COL_EXT, ext_item)
+
+        self._table.blockSignals(False)
+        self._table.setSortingEnabled(True)
+        self._hover_row = -1
+        self._update_convert_btn()
+
+    def _set_all_checked(self, state: bool):
+        self._table.blockSignals(True)
+        cs = Qt.CheckState.Checked if state else Qt.CheckState.Unchecked
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, COL_CHECK)
+            if item:
+                item.setCheckState(cs)
+        self._table.blockSignals(False)
+        self._update_convert_btn()
+
+    def _on_item_changed(self, item: QTableWidgetItem):
+        if item.column() != COL_CHECK:
+            return
+        selected_rows = {idx.row() for idx in self._table.selectedIndexes()}
+        if item.row() in selected_rows and len(selected_rows) > 1:
+            new_state = item.checkState()
+            self._table.blockSignals(True)
+            for r in selected_rows:
+                if r == item.row():
+                    continue
+                chk = self._table.item(r, COL_CHECK)
+                if chk:
+                    chk.setCheckState(new_state)
+            self._table.blockSignals(False)
+        self._update_convert_btn()
+
+    def _on_context_menu(self, pos):
+        import subprocess
+        row = self._table.rowAt(pos.y())
+        if row < 0:
+            return
+        chk = self._table.item(row, COL_CHECK)
+        if not chk:
+            return
+        fi: FileInfo = chk.data(Qt.ItemDataRole.UserRole)
+        if not fi:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet(self.styleSheet() + """
+            QMenu {
+                background: rgba(20, 18, 35, 252);
+                border: 1px solid rgba(255,255,255,16);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 8px 20px 8px 14px;
+                border-radius: 6px;
+                color: rgba(255,255,255,200);
+                font-size: 13px;
+            }
+            QMenu::item:selected {
+                background: rgba(110,88,220,160);
+                color: white;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: rgba(255,255,255,12);
+                margin: 4px 8px;
+            }
+        """)
+
+        file_exists = os.path.isfile(fi.path)
+
+        act_tags      = menu.addAction("🏷  Éditer les tags…")
+        act_tags.setEnabled(file_exists and is_editable(fi.extension))
+        menu.addSeparator()
+        act_open_dir  = menu.addAction("📂  Ouvrir le répertoire")
+        act_open_file = menu.addAction("▶  Ouvrir le fichier")
+        act_open_file.setEnabled(file_exists)
+        menu.addSeparator()
+        act_sel_dir   = menu.addAction("☑  Sélectionner tous les fichiers de ce répertoire")
+        menu.addSeparator()
+        act_delete    = menu.addAction("🗑  Supprimer le fichier")
+        act_delete.setEnabled(file_exists)
+
+        action = menu.exec(self._table.viewport().mapToGlobal(pos))
+
+        if action == act_tags:
+            self._edit_tags(fi.path)
+
+        elif action == act_open_dir:
+            norm = os.path.normpath(fi.path)
+            if os.path.isfile(norm):
+                # File exists → select it in Explorer
+                subprocess.Popen(["explorer", "/select,", norm])
+            else:
+                # File gone → just open the directory
+                subprocess.Popen(["explorer", os.path.normpath(fi.directory)])
+
+        elif action == act_open_file:
+            try:
+                os.startfile(fi.path)
+            except Exception as e:
+                QMessageBox.warning(self, "Erreur", f"Impossible d'ouvrir le fichier :\n{e}")
+
+        elif action == act_sel_dir:
+            target_dir = fi.directory
+            self._table.blockSignals(True)
+            for r in range(self._table.rowCount()):
+                chk_item = self._table.item(r, COL_CHECK)
+                if chk_item:
+                    row_fi: FileInfo = chk_item.data(Qt.ItemDataRole.UserRole)
+                    if row_fi and row_fi.directory == target_dir:
+                        chk_item.setCheckState(Qt.CheckState.Checked)
+            self._table.blockSignals(False)
+            self._update_convert_btn()
+
+        elif action == act_delete:
+            reply = QMessageBox.question(
+                self, "Confirmer la suppression",
+                f"Supprimer définitivement ce fichier ?\n\n{fi.path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                try:
+                    _send_to_recycle_bin(fi.path)
+                    self._table.removeRow(row)
+                    self._files = [f for f in self._files if f.path != fi.path]
+                    n = self._table.rowCount()
+                    self._lbl_count.setText(f"{n} fichier(s)")
+                    self._update_convert_btn()
+                    get_app_logger().info("Fichier envoyé à la corbeille : %s", fi.path)
+                except Exception as e:
+                    QMessageBox.critical(self, "Erreur", f"Impossible de mettre à la corbeille :\n{e}")
+
+    # ── Pré-écoute ────────────────────────────────────────────────────────────
+
+    def _preview_file(self, path: str):
+        if not self._preview.play_file(path):
+            self._set_status("Pré-écoute indisponible (QtMultimedia manquant).")
+            return
+        self._playing_path = path
+        self._refresh_play_column()
+        self._set_status(f"Pré-écoute : {os.path.basename(path)}")
+
+    def _on_preview_stopped(self):
+        self._playing_path = ""
+        self._refresh_play_column()
+
+    # ── Colonne play (survol + lecture) ───────────────────────────────────────
+
+    def _row_fileinfo(self, row: int) -> Optional[FileInfo]:
+        chk = self._table.item(row, COL_CHECK)
+        return chk.data(Qt.ItemDataRole.UserRole) if chk else None
+
+    def _play_icon_for_row(self, row: int) -> str:
+        fi = self._row_fileinfo(row)
+        if fi and self._playing_path and fi.path == self._playing_path:
+            return "⏹"                       # en cours de lecture → clic = stop
+        if row == self._hover_row:
+            return "▶"
+        return ""
+
+    def _refresh_play_column(self):
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, COL_PLAY)
+            if item:
+                item.setText(self._play_icon_for_row(row))
+
+    def _on_cell_entered(self, row: int, _col: int):
+        if row == self._hover_row:
+            return
+        old, self._hover_row = self._hover_row, row
+        for r in (old, row):
+            if 0 <= r < self._table.rowCount():
+                item = self._table.item(r, COL_PLAY)
+                if item:
+                    item.setText(self._play_icon_for_row(r))
+
+    def _on_table_left(self):
+        old, self._hover_row = self._hover_row, -1
+        if 0 <= old < self._table.rowCount():
+            item = self._table.item(old, COL_PLAY)
+            if item:
+                item.setText(self._play_icon_for_row(old))
+
+    def _on_cell_clicked(self, row: int, col: int):
+        if col != COL_PLAY:
+            return
+        fi = self._row_fileinfo(row)
+        if not fi:
+            return
+        if fi.path == self._playing_path:
+            self._preview.stop_and_hide()      # → _on_preview_stopped
+        elif os.path.isfile(fi.path):
+            self._preview_file(fi.path)
+
+    # ── Éditeur de tags ───────────────────────────────────────────────────────
+
+    def _edit_tags(self, path: str):
+        # Le lecteur garde un verrou sur le fichier → le libérer avant écriture
+        if self._preview.current_source() == path:
+            self._preview.stop_and_hide()
+
+        dlg = TagEditorDialog(
+            path,
+            dark=(self._settings.get("theme", "dark") == "dark"),
+            parent=self,
+        )
+        dlg.setStyleSheet(self.styleSheet())
+        dlg.exec()
+        if dlg.saved:
+            self._set_status(f"Tags enregistrés : {os.path.basename(path)}")
+            get_app_logger().info("Tags modifiés : %s", path)
+
+    # ── Glisser-déposer ───────────────────────────────────────────────────────
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
+        dirs  = [p for p in paths if os.path.isdir(p)]
+        files = [p for p in paths if os.path.isfile(p)]
+        if not dirs and not files:
+            return
+        event.acceptProposedAction()
+
+        selected_fmts = [ext for name, ext in SUPPORTED_INPUT_FORMATS.items()
+                         if self._format_checks[name].isChecked()]
+        all_exts = set(SUPPORTED_INPUT_FORMATS.values())
+
+        new_files: List[FileInfo] = []
+        for d in dirs:
+            new_files += scan_directory(d, selected_fmts or list(all_exts))
+        for f in files:
+            # Fichier déposé explicitement → accepté quel que soit le filtre
+            ext = os.path.splitext(f)[1].lstrip(".").lower()
+            if ext in all_exts:
+                fi = file_info_from_path(f)
+                if fi:
+                    new_files.append(fi)
+
+        if dirs:
+            self._dir_edit.setText(dirs[0])
+            self._settings["last_directory"] = dirs[0]
+            self._save_settings()
+
+        existing = {f.path for f in self._files}
+        added = [fi for fi in new_files if fi.path not in existing]
+        self._files += added
+        self._populate_table()
+
+        n = len(self._files)
+        self._lbl_count.setText(f"{n} fichier(s) trouvé(s)")
+        self._set_status(f"{len(added)} fichier(s) ajouté(s) par glisser-déposer")
+        get_app_logger().info("Drag & drop : %d fichier(s) ajouté(s)", len(added))
+
+    def _update_convert_btn(self):
+        count = sum(
+            1 for row in range(self._table.rowCount())
+            if self._table.item(row, COL_CHECK) and
+               self._table.item(row, COL_CHECK).checkState() == Qt.CheckState.Checked
+        )
+        self._btn_convert.setEnabled(count > 0)
+        if count > 0:
+            self._btn_convert.setText(f"  ▶  Convertir  ({count})  ")
+        else:
+            self._btn_convert.setText("  ▶  Convertir  ")
+
+    def _on_format_changed(self):
+        self._update_fmt_desc()
+
+    def _update_fmt_desc(self):
+        fmt = self._combo_out_fmt.currentData()
+        if fmt:
+            self._lbl_fmt_desc.setText(fmt.get("description", ""))
+
+    # ── Conversion ────────────────────────────────────────────────────────────
+
+    def _get_selected_files(self) -> List[FileInfo]:
+        selected = []
+        for row in range(self._table.rowCount()):
+            chk = self._table.item(row, COL_CHECK)
+            if chk and chk.checkState() == Qt.CheckState.Checked:
+                # Retrieve FileInfo by matching path (stored as tooltip)
+                name_item = self._table.item(row, COL_NAME)
+                dir_item  = self._table.item(row, COL_DIR)
+                ext_item  = self._table.item(row, COL_EXT)
+                if name_item and dir_item and ext_item:
+                    name = name_item.text()
+                    directory = dir_item.text()
+                    ext = ext_item.text().lower()
+                    path = os.path.join(directory, f"{name}.{ext}")
+                    for fi in self._files:
+                        if fi.path == path:
+                            selected.append(fi)
+                            break
+        return selected
+
+    def _start_conversion(self):
+        from core.ffmpeg_manager import FFmpegManager
+        from core.config import FFMPEG_DIR
+
+        ffmpeg = FFmpegManager()
+        if not ffmpeg.is_available():
+            self._set_status("FFmpeg introuvable.")
+            return
+
+        selected = self._get_selected_files()
+        if not selected:
+            return
+
+        out_fmt = self._combo_out_fmt.currentData()
+        if not out_fmt:
+            return
+
+        # Detect conflicts
+        conflicts = detect_conflicts(selected, out_fmt)
+        conflict_mode = "rename"
+
+        if conflicts:
+            dlg = _ConflictDialog(conflicts, out_fmt["ext"], self)
+            dlg.setStyleSheet(self.styleSheet())
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            choice = dlg.get_choice()
+            if choice is None:
+                return
+            conflict_mode = choice
+
+        # Stop preview: release any file lock before converting/deleting
+        self._preview.stop_and_hide()
+
+        # Get parallel setting
+        parallel = self._settings.get("parallel", 8)
+        delete   = self._chk_delete.isChecked()
+
+        # Setup UI
+        self._progress_row.show()
+        self._btn_convert.hide()
+        self._btn_cancel_conv.show()
+        self._progress_bar.setValue(0)
+        self._lbl_progress.setText(f"Conversion en cours…  0 / {len(selected)}")
+        self._set_status(f"Conversion de {len(selected)} fichier(s)…")
+
+        # Init summary
+        self._conv_summary = {
+            "total":        len(selected),
+            "success":      [],   # list of source paths
+            "failed":       [],   # list of (basename, error_msg)
+            "source_size":  sum(f.size for f in selected),
+            "output_size":  0,
+            "out_ext":      out_fmt["ext"],
+            "conflict":     conflict_mode,
+            "delete_source": delete,
+        }
+
+        # Start thread
+        self._thread = ConversionThread(
+            files         = selected,
+            ffmpeg_path   = ffmpeg.get_ffmpeg_path(),
+            out_fmt       = out_fmt,
+            parallel      = parallel,
+            delete_source = delete,
+            conflict      = conflict_mode,
+        )
+        self._thread.progress_updated.connect(self._on_progress)
+        self._thread.file_completed.connect(self._on_file_done)
+        self._thread.all_done.connect(self._on_all_done)
+        self._thread.start()
+
+    def _cancel_conversion(self):
+        if self._thread:
+            self._thread.cancel()
+            self._set_status("Annulation en cours…")
+
+    def _on_progress(self, completed: int, total: int):
+        pct = int(completed / total * 100) if total else 0
+        self._progress_bar.setValue(pct)
+        self._lbl_progress.setText(f"Conversion en cours…  {completed} / {total}")
+
+    def _on_file_done(self, src_path: str, out_path: str, success: bool, msg: str):
+        s = self._conv_summary
+        if success:
+            s["success"].append(src_path)
+            if out_path and os.path.exists(out_path):
+                s["output_size"] += os.path.getsize(out_path)
+        else:
+            s["failed"].append((os.path.basename(src_path), msg))
+            self._set_status(f"Erreur : {os.path.basename(src_path)} — {msg[:80]}")
+
+    def _on_all_done(self):
+        self._progress_bar.setValue(100)
+        self._lbl_progress.setText("Conversion terminée !")
+        self._btn_cancel_conv.hide()
+        self._btn_convert.show()
+        self._set_status("Conversion terminée.")
+        QTimer.singleShot(3000, self._hide_progress)
+        self._show_summary_popup(self._conv_summary)
+
+    def _hide_progress(self):
+        self._progress_row.hide()
+        self._progress_bar.setValue(0)
+
+    def _show_summary_popup(self, s: dict):
+        n_ok     = len(s.get("success", []))
+        n_fail   = len(s.get("failed",  []))
+        src_sz   = s.get("source_size", 0)
+        out_sz   = s.get("output_size", 0)
+        delta    = src_sz - out_sz   # positive = freed space
+        delete   = s.get("delete_source", False)
+
+        def _fmt(b: int) -> str:
+            if b >= 1_073_741_824: return f"{b/1_073_741_824:.2f} Go"
+            if b >= 1_048_576:     return f"{b/1_048_576:.1f} Mo"
+            if b >= 1_024:         return f"{b/1_024:.0f} Ko"
+            return f"{b} o"
+
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        dlg.setFixedWidth(460)
+
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("central_widget")
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(14)
+
+        # Title
+        title = QLabel("✅  Conversion terminée")
+        title.setFont(QFont("Segoe UI Variable", 14, QFont.Weight.Bold))
+        title.setStyleSheet("color: #a0e8a0;")
+        lay.addWidget(title)
+
+        # Success / failure counts
+        lbl_ok = QLabel(f"✓  {n_ok} fichier(s) converti(s) avec succès")
+        lbl_ok.setStyleSheet("color: rgba(160,240,160,200); font-size:13px;")
+        lay.addWidget(lbl_ok)
+
+        if n_fail:
+            lbl_err = QLabel(f"✗  {n_fail} fichier(s) en erreur :")
+            lbl_err.setStyleSheet("color: #f08080; font-size:13px;")
+            lay.addWidget(lbl_err)
+            for fname, _emsg in s["failed"][:8]:
+                e = QLabel(f"    • {fname}")
+                e.setStyleSheet("color: rgba(240,160,160,180); font-size:12px;")
+                lay.addWidget(e)
+            if n_fail > 8:
+                lay.addWidget(QLabel(f"    … et {n_fail-8} autre(s)"))
+
+        # Separator
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # Disk usage
+        grid = QWidget()
+        g_lay = QGridLayout(grid)
+        g_lay.setContentsMargins(0, 0, 0, 0)
+        g_lay.setHorizontalSpacing(20)
+        g_lay.setVerticalSpacing(6)
+
+        def _row(label, value, color="#c8c8e0"):
+            lbl_l = QLabel(label); lbl_l.setStyleSheet("color:rgba(200,200,220,140);font-size:12px;")
+            lbl_v = QLabel(value); lbl_v.setStyleSheet(f"color:{color};font-size:13px;font-weight:600;")
+            return lbl_l, lbl_v
+
+        l, v = _row("Source :", _fmt(src_sz)); g_lay.addWidget(l, 0, 0); g_lay.addWidget(v, 0, 1)
+        l, v = _row("Sortie :", _fmt(out_sz)); g_lay.addWidget(l, 1, 0); g_lay.addWidget(v, 1, 1)
+
+        if delete:
+            if delta >= 0:
+                color_d, sign = "#80e880", f"−  {_fmt(delta)}"
+            else:
+                color_d, sign = "#f0c060", f"+  {_fmt(-delta)}"
+            l, v = _row("Espace libéré :", sign, color_d)
+        else:
+            if delta >= 0:
+                color_d, sign = "#80e880", f"−  {_fmt(delta)}  (compression)"
+            else:
+                color_d, sign = "#f0c060", f"+  {_fmt(-delta)}  (expansion)"
+            l, v = _row("Différence :", sign, color_d)
+
+        g_lay.addWidget(l, 2, 0); g_lay.addWidget(v, 2, 1)
+
+        if src_sz > 0 and out_sz > 0:
+            pct = int((1 - out_sz / src_sz) * 100)
+            l2 = QLabel("Ratio :")
+            l2.setStyleSheet("color:rgba(200,200,220,140);font-size:12px;")
+            v2 = QLabel(f"{pct:+d}%")
+            v2.setStyleSheet(f"color:{'#80e880' if pct > 0 else '#f0c060'};font-size:13px;font-weight:600;")
+            g_lay.addWidget(l2, 3, 0); g_lay.addWidget(v2, 3, 1)
+
+        lay.addWidget(grid)
+
+        # Close button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QPushButton("  Fermer  ")
+        btn_ok.setObjectName("btn_primary")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_ok)
+        lay.addLayout(btn_row)
+
+        dlg.setStyleSheet(self.styleSheet())
+        dlg.adjustSize()
+        apply_acrylic(int(dlg.winId()), dark=(self._settings.get("theme","dark") == "dark"))
+        dlg.exec()
+
+    # ── Log window ────────────────────────────────────────────────────────────
+
+    def _toggle_log(self):
+        if self._log_window is None:
+            self._log_window = LogWindow(
+                theme=self._settings.get("theme", "dark")
+            )
+            self._log_window.setStyleSheet(self.styleSheet())
+
+        if self._log_window.isVisible():
+            self._log_window.hide()
+        else:
+            geo = self.geometry()
+            self._log_window.move(geo.x() + 40, geo.y() + geo.height() - 540)
+            self._log_window.show()
+            self._log_window.raise_()
+
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self._settings, self)
+        dlg.setStyleSheet(self.styleSheet())
+        dlg.settings_changed.connect(self._apply_settings)
+        dlg.exec()
+
+    def _apply_settings(self, new_settings: dict):
+        self._settings.update(new_settings)
+        self._save_settings()
+        self._apply_theme()
+
+        # Propagate theme to open log window
+        if self._log_window:
+            self._log_window.apply_stylesheet(self.styleSheet())
+
+    def _apply_theme(self):
+        theme = self._settings.get("theme", "dark")
+        qss   = get_theme(theme)
+        self.setStyleSheet(qss)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _set_status(self, msg: str):
+        self._status_lbl.setText(msg)
+
+    def _toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    # ── Config persistence ────────────────────────────────────────────────────
+
+    def _load_settings(self) -> dict:
+        s = dict(DEFAULT_SETTINGS)
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                s.update(json.load(f))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        return s
+
+    def _save_settings(self):
+        # Persist currently checked formats
+        self._settings["selected_formats"] = [
+            name for name, cb in self._format_checks.items() if cb.isChecked()
+        ] if hasattr(self, "_format_checks") else self._settings.get("selected_formats", [])
+
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._settings, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # WINDOW EVENTS (frameless: drag + resize)
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _tb_press(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def _tb_move(self, event):
+        if self._drag_pos and event.buttons() == Qt.MouseButton.LeftButton:
+            if not self.isMaximized():
+                self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def _tb_release(self, _event):
+        self._drag_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos   = event.position().toPoint()
+            edge  = self._detect_edge(pos)
+            if edge:
+                self._resize_edge  = edge
+                self._resize_start = event.globalPosition().toPoint()
+                self._resize_geom  = self.geometry()
+
+    def mouseMoveEvent(self, event):
+        if self._resize_edge and event.buttons() == Qt.MouseButton.LeftButton:
+            self._do_resize(event.globalPosition().toPoint())
+            return
+        # Update cursor
+        edge = self._detect_edge(event.position().toPoint())
+        cursors = {
+            "n": Qt.CursorShape.SizeVerCursor,  "s": Qt.CursorShape.SizeVerCursor,
+            "e": Qt.CursorShape.SizeHorCursor,  "w": Qt.CursorShape.SizeHorCursor,
+            "ne": Qt.CursorShape.SizeBDiagCursor, "sw": Qt.CursorShape.SizeBDiagCursor,
+            "nw": Qt.CursorShape.SizeFDiagCursor, "se": Qt.CursorShape.SizeFDiagCursor,
+        }
+        if edge:
+            self.setCursor(QCursor(cursors.get(edge, Qt.CursorShape.ArrowCursor)))
+        else:
+            self.unsetCursor()
+
+    def mouseReleaseEvent(self, _event):
+        self._resize_edge = None
+
+    def _detect_edge(self, pos) -> Optional[str]:
+        m = self._RESIZE_MARGIN
+        w, h = self.width(), self.height()
+        x, y = pos.x(), pos.y()
+        on_l = x < m; on_r = x > w - m
+        on_t = y < m; on_b = y > h - m
+        if on_l and on_t: return "nw"
+        if on_r and on_t: return "ne"
+        if on_l and on_b: return "sw"
+        if on_r and on_b: return "se"
+        if on_l: return "w"
+        if on_r: return "e"
+        if on_t: return "n"
+        if on_b: return "s"
+        return None
+
+    def _do_resize(self, gpos):
+        dx = gpos.x() - self._resize_start.x()
+        dy = gpos.y() - self._resize_start.y()
+        g  = self._resize_geom
+        x, y, w, h = g.x(), g.y(), g.width(), g.height()
+        min_w, min_h = self.minimumWidth(), self.minimumHeight()
+        e = self._resize_edge
+
+        if "e" in e: w = max(min_w, w + dx)
+        if "s" in e: h = max(min_h, h + dy)
+        if "w" in e:
+            nw = max(min_w, w - dx)
+            x  = x + (w - nw)
+            w  = nw
+        if "n" in e:
+            nh = max(min_h, h - dy)
+            y  = y + (h - nh)
+            h  = nh
+        self.setGeometry(x, y, w, h)
+
+    # ── showEvent: apply Acrylic after window handle is ready ─────────────────
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        hwnd  = int(self.winId())
+        dark  = self._settings.get("theme", "dark") == "dark"
+        apply_acrylic(hwnd, dark=dark)
+
+    def closeEvent(self, event):
+        self._save_settings()
+        self._preview.stop()
+        if self._log_window:
+            self._log_window.close()
+        super().closeEvent(event)

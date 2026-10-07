@@ -1,0 +1,13 @@
+# binaires FFmpeg (GPL, ~400 Mo) : telecharges a la demande au premier lancement
+ffmpeg_bin/
+
+# etat local & journaux (contiennent des chemins de bibliotheque)
+config.json
+logs/
+startup_error.txt
+
+# caches & outils locaux
+__pycache__/
+*.pyc
+.claude/
+*.lnk
